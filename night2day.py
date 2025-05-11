@@ -22,7 +22,7 @@ import random
 import tempfile
 from pathlib import Path
 from typing import List
-
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -139,9 +139,7 @@ class ImageBuffer:  # History buffer (CycleGAN paper)
         return torch.cat(res, 0)
 
 
-# ───────── ImageDataset 수정 ─────────
-from PIL import Image
-from torchvision import transforms
+# # ───────── ImageDataset 수정 ─────────
 
 class ImageDataset(Dataset):
     def __init__(self, root, mode="train", transform=None):
@@ -177,9 +175,9 @@ class GANLoss(nn.Module):
         return self.loss(pred, target)
 
 
-# —— CycleGAN training ————————————————————————————————————————————
+# # —— CycleGAN training ————————————————————————————————————————————
 
-def train_cyclegan(data_dir: str, epochs: int = 100, batch_size: int = 1, lr: float = 2e-4, device: str = "cuda"):
+def train_cyclegan(data_dir: str, epochs: int = 100, batch_size: int = 4, lr: float = 2e-4, device: str = "cuda"):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     G_A2B, G_B2A = ResnetGenerator().to(device), ResnetGenerator().to(device)
     D_A, D_B = NLayerDiscriminator().to(device), NLayerDiscriminator().to(device)
@@ -192,7 +190,7 @@ def train_cyclegan(data_dir: str, epochs: int = 100, batch_size: int = 1, lr: fl
     tf = transforms.Compose([transforms.Resize(286), transforms.RandomCrop(256), transforms.RandomHorizontalFlip()])
     dl = DataLoader(
             ImageDataset(data_dir, mode="train"),   # transform 내장
-            batch_size=1,
+            batch_size=4,
             shuffle=True,
             num_workers=4,    # macOS MPS: 먼저 0으로 테스트
             pin_memory=False)
@@ -236,12 +234,6 @@ def train_cyclegan(data_dir: str, epochs: int = 100, batch_size: int = 1, lr: fl
 
 # —— Image augmentation with the trained generator —————————————————
 
-from PIL import Image
-from torchvision import transforms
-from torchvision.utils import save_image
-import torch, os
-from pathlib import Path
-
 def augment_with_generator(
         generator_ckpt: str,
         input_dir: str,
@@ -249,7 +241,7 @@ def augment_with_generator(
         device: str = "cuda"
 ):
     # ---------------- device ----------------
-    device = torch.device("mps" if (device == "cuda" and torch.backends.mps.is_available()) else device)
+    device = torch.device(device if (device == "cuda" and torch.backends.cuda.is_available()) else device)
 
     # ---------------- generator -------------
     gen = ResnetGenerator().to(device)
@@ -274,43 +266,26 @@ def augment_with_generator(
     print(f"✅ saved augmented images to {output_dir}")
 
 # ----------------------------------------------------------
-# ◼︎  Section 2: YOLOv8 Domain‑Adaptation ◼︎
+# ■▪■ Section 2: YOLOv8 Domain‑Adaptation with PairedTrainer ■▪■
 # ----------------------------------------------------------
 
-from ultralytics import YOLO  # after pip install ultralytics>=8.3.127
+from pathlib import Path
+import tempfile
 import yaml
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
+from ultralytics import YOLO
+from ultralytics.models.yolo.detect import DetectionTrainer
 
-# — Utility: copy+patch base YAML to the system temp dir ———————————
-
-def _fallback_yaml_search(base_yaml: str) -> Path | None:
-    """Return a plausible Path for *base_yaml* inside Ultralytics, or None."""
-    # 1) new structure `ultralytics/cfg/models/v8/…`
-    try:
-        with pkg.path("ultralytics.cfg.models.v8", base_yaml) as p:
-            return Path(p)
-    except (FileNotFoundError, ModuleNotFoundError):
-        pass
-    # 2) bundled but not exposed as resource (older builds)
-    try:
-        res_root = importlib.resources.files("ultralytics")
-        p = res_root.joinpath(f"cfg/models/v8/{base_yaml}")
-        return p if p.is_file() else None
-    except Exception:  # pragma: no cover
-        return None
-
-
-def custom_cfg(base_yaml: str = "yolov8n.yaml", nc: int = 8) -> str:
-    """Locate *base_yaml*, patch `nc`, write to TMP, and return the new path."""
-    # explicit path provided by caller
-    p = Path(base_yaml)
+# === Revised custom_cfg ===
+def custom_cfg(base_yaml: str, nc: int = 8) -> str:
+    p = Path(base_yaml).expanduser().resolve()
     if not p.is_file():
-        p = _fallback_yaml_search(base_yaml) or Path()
-    if not p.is_file():
-        raise FileNotFoundError(
-            f"Could not locate '{base_yaml}' inside the Ultralytics package. "
-            "Make sure Ultralytics ≥ 8.3.127 is installed correctly or pass an "
-            "explicit path to a YOLOv8 YAML file."
-        )
+        raise FileNotFoundError(f"Cannot find model YAML: {p}")
+
     out = Path(tempfile.gettempdir()) / f"{p.stem}_{nc}cls.yaml"
     if not out.exists():
         cfg = yaml.safe_load(p.read_text())
@@ -318,15 +293,24 @@ def custom_cfg(base_yaml: str = "yolov8n.yaml", nc: int = 8) -> str:
         out.write_text(yaml.safe_dump(cfg))
     return str(out)
 
+# === Dummy data.yaml writer ===
+def write_dummy_yaml(nc):
+    path = Path(tempfile.gettempdir()) / "dummy_data.yaml"
+    path.write_text(yaml.safe_dump({
+        "train": "unused",
+        "val": "unused",
+        "nc": nc,
+        "names": [f"class_{i}" for i in range(nc)]
+    }))
+    return str(path)
 
-# — Domain‑classifier helpers ————————————————————————————————
-
-
+# === Domain adaptation helpers ===
 class GRLayer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, α): ctx.α = α; return x
     @staticmethod
-    def backward(ctx, g):   return -g * ctx.α, None
+    def backward(ctx, g): return -g * ctx.α, None
+
 def grad_reverse(x, α=1): return GRLayer.apply(x, α)
 
 class DomainClassifier(nn.Module):
@@ -336,22 +320,91 @@ class DomainClassifier(nn.Module):
             nn.AdaptiveAvgPool2d(1), nn.Flatten(),
             nn.Linear(ch, 256), nn.ReLU(True),
             nn.Linear(256, 2))
+
     def forward(self, x, α): return self.net(grad_reverse(x, α))
 
+# === Dataset ===
+class PairedImageDataset(Dataset):
+    def __init__(self, night_dir, day_dir, label_dir, transform=None):
+        self.night_files = sorted(Path(night_dir).glob("*.jpg"))
+        self.day_files = sorted(Path(day_dir).glob("*.jpg"))
+        self.label_dir = Path(label_dir)
 
-# — Custom YOLOv8 model with domain heads —————————————————————————
+        assert len(self.night_files) == len(self.day_files), \
+            f"Mismatch: {len(self.night_files)} night vs {len(self.day_files)} day files"
 
+        self.transform = transform or transforms.Compose([
+            transforms.Resize(640),
+            transforms.ToTensor()
+        ])
 
-class YOLOv8_DA(YOLO):
-    def __init__(self, num_classes=8, base_yaml="yolov8n.yaml"):
-        # YAML 구성 파일을 기반으로 DetectionModel 생성
-        super().__init__(model=custom_cfg(base_yaml, num_classes),
-                         task="detect", verbose=False)
+    def load_yolo_label(self, image_path):
+        label_path = self.label_dir / (image_path.stem + ".txt")
+        if not label_path.exists():
+            return torch.zeros((0, 6))
+        labels = []
+        with open(label_path, "r") as f:
+            for line in f:
+                cls, x, y, w, h = map(float, line.strip().split())
+                labels.append([0, cls, x, y, w, h])
+        return torch.tensor(labels, dtype=torch.float32)
 
-        # 손실 함수와 도메인 분류기 placeholder
-        self.model.domain_loss = nn.CrossEntropyLoss()
-        self.model.domP3 = None
-        self.model.domP5 = None
+    def __getitem__(self, idx):
+        night_path = self.night_files[idx]
+        day_path = self.day_files[idx]
+
+        night_img = Image.open(night_path).convert("RGB")
+        day_img = Image.open(day_path).convert("RGB")
+        label = self.load_yolo_label(night_path)
+
+        return {
+            "night": self.transform(night_img),
+            "day": self.transform(day_img),
+            "label": label
+        }
+
+    def __len__(self):
+        return len(self.night_files)
+
+# === Custom Trainer with integrated domain-adaptation ===
+class PairedTrainer(DetectionTrainer):
+    def __init__(self, night_dir, day_dir, label_dir, model_yaml, nc, overrides):
+        self.night_dir = night_dir
+        self.day_dir = day_dir
+        self.label_dir = label_dir
+        self.model_yaml = model_yaml
+        self.num_classes = nc
+
+        super().__init__(overrides=overrides)
+
+        # ✅ 핵심: self.data 명시적 설정
+        self.data = {
+            "nc": nc,
+            "names": [f"class_{i}" for i in range(nc)]
+        }
+
+    def get_dataset(self):
+        # validation, test용 기본값 대체 (실제로 사용 안 할 것이므로 dummy)
+        return None, None
+    def plot_training_labels(self):
+        self.label_loss_curve = None  # Skip plotting
+        print("⚠️ Skipping label plotting for custom PairedImageDataset.")
+
+    def get_model(self, cfg=None, weights=None, verbose=False):
+        model_cfg = custom_cfg(self.model_yaml, self.num_classes)
+        model = YOLO(model_cfg).model
+        model.domain_loss = nn.CrossEntropyLoss()
+        model.domP3 = None
+        model.domP5 = None
+        return model
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
+        dataset = PairedImageDataset(
+            night_dir=self.night_dir,
+            day_dir=self.day_dir,
+            label_dir=self.label_dir
+        )
+        return DataLoader(dataset, batch_size=batch_size, shuffle=(mode == "train"), num_workers=4)
 
     def _lazy_init(self, p3, p5):
         device = p3.device
@@ -359,68 +412,91 @@ class YOLOv8_DA(YOLO):
             self.model.domP3 = DomainClassifier(p3.shape[1]).to(device)
             self.model.domP5 = DomainClassifier(p5.shape[1]).to(device)
 
-    def forward(self, x, dom=None, α=0.1, **kw):
-        p3, p4, p5 = self.model.model[:-1](x)              # backbone + neck
-        self._lazy_init(p3, p5)                            # 최초 1회 초기화
-        det = self.model.model[-1]((p3, p4, p5))           # head
+    def train_step(self, batch):
+        night = batch["night"].to(self.device)
+        day = batch["day"].to(self.device)
+        targets = batch["label"].to(self.device)
 
-        if self.training:
-            d3 = self.model.domP3(p3, α)
-            d5 = self.model.domP5(p5, α)
-            return det, d3, d5
-        return det
+        x = torch.cat([night, day], dim=0)
+        dom_labels = torch.tensor([0]*night.size(0) + [1]*day.size(0)).to(self.device)
 
-# — Training loop ——————————————————————————————————————————————
+        p3, p4, p5 = self.model.model[:-1](x)
+        self._lazy_init(p3, p5)
+        det = self.model.model[-1]((p3, p4, p5))
 
-from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics import YOLO
-import torch, torch.nn as nn
-from pathlib import Path
+        d3 = self.model.domP3(p3, α=0.1)
+        d5 = self.model.domP5(p5, α=0.1)
 
-def train_yolov8_da(data_yaml, model_yaml, epochs=60, batch=8, device="cuda"):
-    model = YOLOv8_DA(num_classes=10, base_yaml=model_yaml)
+        loss_domain = (self.model.domain_loss(d3, dom_labels) +
+                       self.model.domain_loss(d5, dom_labels)) * 0.5
+        det_loss = self.model.loss(det[:night.size(0)], targets)["loss"]
+        loss = det_loss + loss_domain
 
-    trainer = DetectionTrainer(overrides=dict(
-        data=data_yaml,
-        epochs=epochs,
-        batch=batch,
-        imgsz=640,
-        device=device,
-        workers=4,
-    ))
+        return loss, det
 
-    # 커스텀 모델 주입
-    trainer.model = model.model  # <-- 여기만 사용
-    # 커스텀 속성 주입
-    trainer.model.domain_loss = model.model.domain_loss
-    trainer.model.domP3 = model.model.domP3
-    trainer.model.domP5 = model.model.domP5
+# === Training ===
+def train_yolov8_da(night_dir, day_dir, label_dir,
+                    model_yaml="yolov8n.yaml", nc=10,
+                    epochs=60, batch=8, device="cuda"):
+    print("🚀 Starting training with custom dataset (PairedTrainer):")
+    dummy_yaml = write_dummy_yaml(nc)
+    overrides = {
+        'data': dummy_yaml,
+        'model': model_yaml,
+        'epochs': epochs,
+        'batch': batch,
+        'device': device,
+        'imgsz': 640
+    }
 
+    trainer = PairedTrainer(
+        night_dir=night_dir,
+        day_dir=day_dir,
+        label_dir=label_dir,
+        model_yaml=model_yaml,
+        nc=nc,
+        overrides=overrides
+    )
     trainer.train()
 
-# —————————————————————————————————————————————— CLI ————————————
-
+# === CLI entrypoint ===
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", required=True, choices=["train_gan", "augment", "train_yolo"])
-    p.add_argument("--data_dir")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--generator_ckpt")
-    p.add_argument("--input_dir")
-    p.add_argument("--output_dir")
-    p.add_argument("--data_yaml")
-    p.add_argument("--model_yaml", default="yolov8n.yaml")  # 추가됨
-    p.add_argument("--device", default="cuda")
-    args = p.parse_args()
-
+    import argparse
     torch.set_float32_matmul_precision("medium")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", required=True, choices=["train_gan", "augment", "train_yolo"])
+    parser.add_argument("--data_dir")
+    parser.add_argument("--generator_ckpt")
+    parser.add_argument("--input_dir")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--night_dir")
+    parser.add_argument("--day_dir")
+    parser.add_argument("--label_dir")
+    parser.add_argument("--model_yaml", default="yolov8n.yaml")
+    parser.add_argument("--nc", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args()
 
     if args.mode == "train_gan":
         assert args.data_dir, "--data_dir required for CycleGAN training"
         train_cyclegan(args.data_dir, args.epochs, device=args.device)
     elif args.mode == "augment":
-        assert all((args.generator_ckpt, args.input_dir, args.output_dir))
+        assert all([args.generator_ckpt, args.input_dir, args.output_dir]), \
+            "--generator_ckpt, --input_dir, --output_dir are required for augmentation"
         augment_with_generator(args.generator_ckpt, args.input_dir, args.output_dir, device=args.device)
-    else:  # train_yolo
-        assert args.data_yaml and args.model_yaml
-        train_yolov8_da(args.data_yaml, args.model_yaml, args.epochs, device=args.device)
+    elif args.mode == "train_yolo":
+        assert all([args.night_dir, args.day_dir, args.label_dir]), \
+            "--night_dir, --day_dir, --label_dir are required for YOLOv8 domain adaptation training"
+        train_yolov8_da(
+            night_dir=args.night_dir,
+            day_dir=args.day_dir,
+            label_dir=args.label_dir,
+            model_yaml=args.model_yaml,
+            nc=args.nc,
+            epochs=args.epochs,
+            batch=args.batch,
+            device=args.device
+        )

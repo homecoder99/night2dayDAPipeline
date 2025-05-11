@@ -334,7 +334,7 @@ class PairedImageDataset(Dataset):
             f"Mismatch: {len(self.night_files)} night vs {len(self.day_files)} day files"
 
         self.transform = transform or transforms.Compose([
-            transforms.Resize(640),
+            transforms.Resize((640, 640)),  # ✅ 튜플로 강제 지정
             transforms.ToTensor()
         ])
 
@@ -360,13 +360,21 @@ class PairedImageDataset(Dataset):
         return {
             "night": self.transform(night_img),
             "day": self.transform(day_img),
-            "label": label
+            "label": label,
+            "im_file": str(day_path)  # ✅ 반드시 포함
         }
 
     def __len__(self):
         return len(self.night_files)
 
 # === Custom Trainer with integrated domain-adaptation ===
+
+def custom_collate(batch):
+    nights = torch.stack([item["night"] for item in batch])
+    days = torch.stack([item["day"] for item in batch])
+    labels = [item["label"] for item in batch]  # 리스트로 유지
+    im_files = [item["im_file"] for item in batch]  # ✅ 추가됨
+    return {"night": nights, "day": days, "label": labels, "im_file": im_files}
 class PairedTrainer(DetectionTrainer):
     def __init__(self, night_dir, day_dir, label_dir, model_yaml, nc, overrides):
         self.night_dir = night_dir
@@ -386,10 +394,42 @@ class PairedTrainer(DetectionTrainer):
     def get_dataset(self):
         # validation, test용 기본값 대체 (실제로 사용 안 할 것이므로 dummy)
         return None, None
+    
     def plot_training_labels(self):
         self.label_loss_curve = None  # Skip plotting
         print("⚠️ Skipping label plotting for custom PairedImageDataset.")
 
+    def preprocess_batch(self, batch):
+        # 예시: night 이미지를 사용
+        batch["img"] = batch["day"]
+
+        cls_list = []
+        bboxes_list = []
+        batch_idx_list = []
+        im_files = []
+
+        for i, targets in enumerate(batch["label"]):
+            if targets.numel() == 0:
+                continue
+            cls_list.append(targets[:, 1])       # 클래스 라벨
+            bboxes_list.append(targets[:, 2:6])  # 바운딩 박스 좌표
+            batch_idx_list.append(torch.full((targets.size(0),), i, dtype=torch.long))
+            im_files.append(batch["im_file"][i])  # 이미지 파일 경로
+
+        if cls_list:
+            batch["cls"] = torch.cat(cls_list, dim=0)
+            batch["bboxes"] = torch.cat(bboxes_list, dim=0)
+            batch["batch_idx"] = torch.cat(batch_idx_list, dim=0)
+        else:
+            batch["cls"] = torch.zeros((0,), dtype=torch.float32)
+            batch["bboxes"] = torch.zeros((0, 4), dtype=torch.float32)
+            batch["batch_idx"] = torch.zeros((0,), dtype=torch.long)
+
+        batch["im_file"] = im_files
+
+        return batch
+
+    
     def get_model(self, cfg=None, weights=None, verbose=False):
         model_cfg = custom_cfg(self.model_yaml, self.num_classes)
         model = YOLO(model_cfg).model
@@ -404,7 +444,12 @@ class PairedTrainer(DetectionTrainer):
             day_dir=self.day_dir,
             label_dir=self.label_dir
         )
-        return DataLoader(dataset, batch_size=batch_size, shuffle=(mode == "train"), num_workers=4)
+        return DataLoader(
+            dataset, batch_size=batch_size,
+            shuffle=(mode == "train"),
+            num_workers=4,
+            collate_fn=custom_collate  # 👈 여기!
+        )
 
     def _lazy_init(self, p3, p5):
         device = p3.device
@@ -415,7 +460,7 @@ class PairedTrainer(DetectionTrainer):
     def train_step(self, batch):
         night = batch["night"].to(self.device)
         day = batch["day"].to(self.device)
-        targets = batch["label"].to(self.device)
+        targets = [t.to(self.device) for t in batch["label"]]
 
         x = torch.cat([night, day], dim=0)
         dom_labels = torch.tensor([0]*night.size(0) + [1]*day.size(0)).to(self.device)

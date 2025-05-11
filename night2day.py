@@ -280,6 +280,12 @@ from PIL import Image
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer
 
+import os
+import csv
+import torchvision
+import matplotlib.pyplot as plt
+from ultralytics.utils.metrics import box_iou
+
 # === Revised custom_cfg ===
 def custom_cfg(base_yaml: str, nc: int = 8) -> str:
     p = Path(base_yaml).expanduser().resolve()
@@ -334,7 +340,7 @@ class PairedImageDataset(Dataset):
             f"Mismatch: {len(self.night_files)} night vs {len(self.day_files)} day files"
 
         self.transform = transform or transforms.Compose([
-            transforms.Resize((640, 640)),  # ✅ 튜플로 강제 지정
+            transforms.Resize((640, 640)),
             transforms.ToTensor()
         ])
 
@@ -357,24 +363,63 @@ class PairedImageDataset(Dataset):
         day_img = Image.open(day_path).convert("RGB")
         label = self.load_yolo_label(night_path)
 
+        # ✅ 원본 크기 추출
+        ori_shape = day_img.size[::-1]  # PIL: (W, H) → YOLO: (H, W)
+        ratio_pad = ((1.0,), (0.0, 0.0))  # gain, pad
+
         return {
             "night": self.transform(night_img),
             "day": self.transform(day_img),
             "label": label,
-            "im_file": str(day_path)  # ✅ 반드시 포함
+            "im_file": str(day_path),
+            "ori_shape": ori_shape,  # ✅ 추가됨
+            "ratio_pad": ratio_pad  # ✅ 추가
         }
 
     def __len__(self):
         return len(self.night_files)
 
-# === Custom Trainer with integrated domain-adaptation ===
-
+# === Collate function ===
 def custom_collate(batch):
     nights = torch.stack([item["night"] for item in batch])
     days = torch.stack([item["day"] for item in batch])
-    labels = [item["label"] for item in batch]  # 리스트로 유지
-    im_files = [item["im_file"] for item in batch]  # ✅ 추가됨
-    return {"night": nights, "day": days, "label": labels, "im_file": im_files}
+    labels = [item["label"] for item in batch]
+    im_files = [item["im_file"] for item in batch]
+    ori_shapes = [item["ori_shape"] for item in batch]
+
+    # ✅ 방탄 ratio_pad 처리
+    ratio_pads = []
+    for i, item in enumerate(batch):
+        rp = item.get("ratio_pad", ((1.0,), (0.0, 0.0)))
+        ratio_pads.append(rp)
+
+    # ✅ YOLOv8용 라벨 처리
+    cls_list, bboxes_list, batch_idx_list = [], [], []
+    for i, targets in enumerate(labels):
+        if targets.numel() == 0:
+            continue
+        cls_list.append(targets[:, 1])
+        bboxes_list.append(targets[:, 2:6])
+        batch_idx_list.append(torch.full((targets.shape[0],), i, dtype=torch.long))
+
+    cls = torch.cat(cls_list, dim=0) if cls_list else torch.zeros((0,), dtype=torch.float32)
+    bboxes = torch.cat(bboxes_list, dim=0) if bboxes_list else torch.zeros((0, 4), dtype=torch.float32)
+    batch_idx = torch.cat(batch_idx_list, dim=0) if batch_idx_list else torch.zeros((0,), dtype=torch.long)
+
+    return {
+        "night": nights,
+        "day": days,
+        "label": labels,
+        "im_file": im_files,
+        "ori_shape": ori_shapes,
+        "img": days,  # 모델 입력용
+        "cls": cls,
+        "bboxes": bboxes,
+        "batch_idx": batch_idx,
+        "ratio_pad": ratio_pads
+    }
+
+# === Custom Trainer ===
 class PairedTrainer(DetectionTrainer):
     def __init__(self, night_dir, day_dir, label_dir, model_yaml, nc, overrides):
         self.night_dir = night_dir
@@ -385,59 +430,48 @@ class PairedTrainer(DetectionTrainer):
 
         super().__init__(overrides=overrides)
 
-        # ✅ 핵심: self.data 명시적 설정
+        self.yolo = YOLO(model_yaml)
+        self.model = self.yolo.model.float().to(self.device)
+
         self.data = {
             "nc": nc,
-            "names": [f"class_{i}" for i in range(nc)]
+            "names": {i: f"class_{i}" for i in range(nc)}  # ✅ dict 형식으로
         }
 
+    def final_eval(self):
+        print("⚠️ Skipping final_eval(): no standard dataset used.")
+
     def get_dataset(self):
-        # validation, test용 기본값 대체 (실제로 사용 안 할 것이므로 dummy)
         return None, None
-    
+
     def plot_training_labels(self):
-        self.label_loss_curve = None  # Skip plotting
+        self.label_loss_curve = None
         print("⚠️ Skipping label plotting for custom PairedImageDataset.")
 
     def preprocess_batch(self, batch):
-        # 예시: night 이미지를 사용
-        batch["img"] = batch["day"]
+        batch["img"] = batch["day"].to(self.device).float()
 
-        cls_list = []
-        bboxes_list = []
-        batch_idx_list = []
+        cls_list, bboxes_list, batch_idx_list = [], [], []
         im_files = []
 
         for i, targets in enumerate(batch["label"]):
             if targets.numel() == 0:
                 continue
-            cls_list.append(targets[:, 1])       # 클래스 라벨
-            bboxes_list.append(targets[:, 2:6])  # 바운딩 박스 좌표
+            cls_list.append(targets[:, 1])
+            bboxes_list.append(targets[:, 2:6])
             batch_idx_list.append(torch.full((targets.size(0),), i, dtype=torch.long))
-            im_files.append(batch["im_file"][i])  # 이미지 파일 경로
+            im_files.append(batch["im_file"][i])
 
-        if cls_list:
-            batch["cls"] = torch.cat(cls_list, dim=0)
-            batch["bboxes"] = torch.cat(bboxes_list, dim=0)
-            batch["batch_idx"] = torch.cat(batch_idx_list, dim=0)
-        else:
-            batch["cls"] = torch.zeros((0,), dtype=torch.float32)
-            batch["bboxes"] = torch.zeros((0, 4), dtype=torch.float32)
-            batch["batch_idx"] = torch.zeros((0,), dtype=torch.long)
-
+        batch["cls"] = torch.cat(cls_list, dim=0) if cls_list else torch.zeros((0,), dtype=torch.float32)
+        batch["bboxes"] = torch.cat(bboxes_list, dim=0) if bboxes_list else torch.zeros((0, 4), dtype=torch.float32)
+        batch["batch_idx"] = torch.cat(batch_idx_list, dim=0) if batch_idx_list else torch.zeros((0,), dtype=torch.long)
         batch["im_file"] = im_files
 
         return batch
 
-    
     def get_model(self, cfg=None, weights=None, verbose=False):
-        model_cfg = custom_cfg(self.model_yaml, self.num_classes)
-        model = YOLO(model_cfg).model
-        model.domain_loss = nn.CrossEntropyLoss()
-        model.domP3 = None
-        model.domP5 = None
-        return model
-
+        return self.model  # 이미 self.model = YOLO(...).model 에서 설정함
+    
     def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
         dataset = PairedImageDataset(
             night_dir=self.night_dir,
@@ -448,8 +482,67 @@ class PairedTrainer(DetectionTrainer):
             dataset, batch_size=batch_size,
             shuffle=(mode == "train"),
             num_workers=4,
-            collate_fn=custom_collate  # 👈 여기!
+            collate_fn=custom_collate
         )
+    
+    def get_val_dataloader(self):
+        dataset = PairedImageDataset(
+            night_dir=self.night_dir,
+            day_dir=self.day_dir,
+            label_dir=self.label_dir  # ✅ label은 동일 사용
+        )
+        return DataLoader(
+            dataset,
+            batch_size=1,  # 💡 1로 고정 (정확한 비교를 위해)
+            shuffle=False,
+            num_workers=2,
+            collate_fn=custom_collate
+        )
+
+    @torch.no_grad()
+    def validate_custom(self, save_dir="results"):
+
+        def xywh2xyxy(xywh):
+            out = xywh.clone()
+            out[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
+            out[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
+            out[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
+            out[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
+            return out
+
+        self.model.eval()
+        dataloader = self.get_val_dataloader()
+        os.makedirs(save_dir, exist_ok=True)
+        csv_path = os.path.join(save_dir, "val_predictions.csv")
+
+        with open(csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["image", "gt_boxes", "pred_box", "IoU", "conf", "cls"])
+
+            for i, batch in enumerate(dataloader):
+                img = batch["img"].to(self.device)
+                im_file = batch["im_file"][0]
+                basename = os.path.basename(im_file)
+
+                targets = batch["label"][0][:, 1:].clone()
+                targets[:, :4] = xywh2xyxy(targets[:, :4])  # xywh → xyxy
+
+                results = self.yolo.predict(img, verbose=False)
+                pred_boxes = results[0].boxes.data.to(self.device) if results[0].boxes is not None else torch.empty((0, 6), device=self.device)
+
+                for p in pred_boxes:
+                    pred_box = p[:4].unsqueeze(0)
+                    iou = box_iou(pred_box, targets[:, :4])[0].max().item() if len(targets) else 0.0
+                    writer.writerow([
+                        basename,
+                        targets.tolist(),
+                        pred_box.tolist(),
+                        f"{iou:.4f}",
+                        f"{p[4]:.2f}",
+                        int(p[5])
+                    ])
+
+        print(f"✅ Validation complete. Results saved to {csv_path}")
 
     def _lazy_init(self, p3, p5):
         device = p3.device
@@ -458,12 +551,12 @@ class PairedTrainer(DetectionTrainer):
             self.model.domP5 = DomainClassifier(p5.shape[1]).to(device)
 
     def train_step(self, batch):
-        night = batch["night"].to(self.device)
-        day = batch["day"].to(self.device)
-        targets = [t.to(self.device) for t in batch["label"]]
+        night = batch["night"].to(self.device).float()
+        day = batch["day"].to(self.device).float()
+        targets = [t.to(self.device).float() for t in batch["label"]]
 
-        x = torch.cat([night, day], dim=0)
-        dom_labels = torch.tensor([0]*night.size(0) + [1]*day.size(0)).to(self.device)
+        x = torch.cat([night, day], dim=0).float()
+        dom_labels = torch.tensor([0]*night.size(0) + [1]*day.size(0), device=self.device)
 
         p3, p4, p5 = self.model.model[:-1](x)
         self._lazy_init(p3, p5)
@@ -475,20 +568,19 @@ class PairedTrainer(DetectionTrainer):
         loss_domain = (self.model.domain_loss(d3, dom_labels) +
                        self.model.domain_loss(d5, dom_labels)) * 0.5
         det_loss = self.model.loss(det[:night.size(0)], targets)["loss"]
-        
+
         λ_domain = 1.0
         loss = det_loss + λ_domain * loss_domain
 
         return loss, det
 
-# === Training ===
+# === Training Entrypoint ===
 def train_yolov8_da(night_dir, day_dir, label_dir,
                     model_yaml="yolov8n.yaml", nc=10,
                     epochs=60, batch=8, device="cuda"):
     print("🚀 Starting training with custom dataset (PairedTrainer):")
     dummy_yaml = write_dummy_yaml(nc)
     overrides = {
-        'data': dummy_yaml,
         'model': model_yaml,
         'epochs': epochs,
         'batch': batch,
@@ -504,7 +596,9 @@ def train_yolov8_da(night_dir, day_dir, label_dir,
         nc=nc,
         overrides=overrides
     )
+
     trainer.train()
+    trainer.validate_custom()
 
 # === CLI entrypoint ===
 if __name__ == "__main__":

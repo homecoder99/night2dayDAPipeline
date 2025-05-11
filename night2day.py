@@ -430,7 +430,9 @@ class PairedTrainer(DetectionTrainer):
         loss_domain = (self.model.domain_loss(d3, dom_labels) +
                        self.model.domain_loss(d5, dom_labels)) * 0.5
         det_loss = self.model.loss(det[:night.size(0)], targets)["loss"]
-        loss = det_loss + loss_domain
+        
+        λ_domain = 1.0
+        loss = det_loss + λ_domain * loss_domain
 
         return loss, det
 

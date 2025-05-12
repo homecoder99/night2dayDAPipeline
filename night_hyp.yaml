@@ -1,0 +1,16 @@
+# night_hyp.yaml  (Flat version that the parser accepts)
+
+# ── Augmentation ──
+hsv_h: 0.0
+hsv_s: 0.20
+hsv_v: 0.20
+mosaic: 0.70
+mixup: 0.20
+copy_paste: 0.10
+
+# ── Optimizer / Scheduler ──
+lr0: 0.003
+lrf: 0.10
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 5

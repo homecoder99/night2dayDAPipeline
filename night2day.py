@@ -598,7 +598,7 @@ def train_yolov8_da(night_dir, day_dir, label_dir,
     )
 
     trainer.train()
-    trainer.validate_custom()
+    # trainer.validate_custom()
 
 # === CLI entrypoint ===
 if __name__ == "__main__":

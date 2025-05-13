@@ -47,35 +47,87 @@ def clahe_retinex(img):
     img_ret = cv2.normalize(img_ret, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     return img_ret
 
+import torch, kornia as K
+import cv2, numpy as np
+from functools import partial
+
+# ─────────────────────────────────────────────────────────────
+# 1. GPU 버전 CLAHE + Retinex
+# ─────────────────────────────────────────────────────────────
+def clahe_retinex_gpu(bgr_8u: np.ndarray, device="cuda"):
+    """
+    Args  : BGR uint8 image (H, W, 3)
+    Return: BGR uint8 image after CLAHE + MSR (PyTorch/Kornia GPU)
+    """
+    # ① OpenCV BGR → RGB, 0-1 정규화 → (1,3,H,W) 텐서
+    rgb = cv2.cvtColor(bgr_8u, cv2.COLOR_BGR2RGB)
+    t   = torch.from_numpy(rgb).permute(2,0,1).unsqueeze(0).float().to(device) / 255.
+
+    # ② CLAHE (clipLimit=2.0, tileGrid=(8,8))
+    t = K.enhance.equalize_clahe(t, clip_limit=2.0)
+
+    # ③ Multi-Scale Retinex (σ=15,80,250)
+    t = K.enhance.retinex_multi_scale(t, sigmas=[15, 80, 250])
+
+    # ④ 0-1 → uint8 BGR로 되돌리기
+    t = (t.clamp(0, 1) * 255).byte().squeeze(0).permute(1,2,0).cpu().numpy()
+    return cv2.cvtColor(t, cv2.COLOR_RGB2BGR)
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. 전처리 캐시 함수 수정
+# ─────────────────────────────────────────────────────────────
 def preprocess_and_cache():
-    """ 밝기 보정 & cache 저장 """
+    """train 이미지를 CLAHE+Retinex(GPU)로 보정하여 images_aug/train 저장,
+       동일 상대경로에 labels/train 복사 → 새 data.yaml 반환"""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    img_dir = Path(yaml.safe_load(open(DATA_YAML))['path'] + '/' + yaml.safe_load(open(DATA_YAML))['train'])
-    out_dir = CACHE_DIR/img_dir.name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(img_dir)
-    for img_path in tqdm(list(img_dir.rglob('*.jpg')), desc='CLAHE/Retinex'):
-        rel = img_path.relative_to(img_dir)
-        out_path = out_dir/rel
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        if not out_path.exists():
-            img = cv2.imread(str(img_path))
-            cv2.imwrite(str(out_path), clahe_retinex(img))
-    # ── 새 data.yaml 작성 ──
-    ds = yaml.safe_load(open(DATA_YAML))
+
+    # --- data.yaml 정보 파싱 ---
+    ds       = yaml.safe_load(open(DATA_YAML))
+    root     = Path(ds['path'])
+    train_cfg= ds['train']
+    img_src  = root / (train_cfg['images'] if isinstance(train_cfg, dict) else train_cfg)
+    lbl_src  = root / (train_cfg['labels'] if isinstance(train_cfg, dict) else 'labels/train')
+
+    img_dst  = DATA_ROOT / 'images_aug' / 'train'
+    lbl_dst  = DATA_ROOT / 'labels'      / 'train'
+    img_dst.mkdir(parents=True, exist_ok=True)
+
+    # --- CPU·GPU 함수 선택 ---
+    fn = clahe_retinex_gpu if torch.cuda.is_available() else clahe_retinex
+    desc = 'CLAHE/Retinex GPU' if torch.cuda.is_available() else 'CLAHE/Retinex CPU'
+
+    # --- 이미지 보정 + 라벨 복사 ---
+    for img_p in tqdm(list(img_src.rglob('*.jpg')), desc=desc):
+        rel = img_p.relative_to(img_src)
+        out_img = img_dst / rel
+        out_img.parent.mkdir(parents=True, exist_ok=True)
+
+        if not out_img.exists():
+            img = cv2.imread(str(img_p))
+            cv2.imwrite(str(out_img), fn(img))   # ← GPU or CPU
+
+        # 라벨
+        lbl_src_p = lbl_src / rel.with_suffix('.txt')
+        lbl_dst_p = lbl_dst / rel.with_suffix('.txt')
+        lbl_dst_p.parent.mkdir(parents=True, exist_ok=True)
+        if lbl_src_p.exists() and not lbl_dst_p.exists():
+            shutil.copy(lbl_src_p, lbl_dst_p)
+
+    # --- 새 data.yaml 생성 ---
     new_yaml = {
         'path' : str(DATA_ROOT),
         'train': {'images': 'images_aug/train', 'labels': 'labels/train'},
-        'val'  : {'images': 'images/val',   'labels': 'labels/val'},
-        'test' : {'images': 'images/test',  'labels': 'labels/test'},
+        'val'  : ds['val'],
+        'test' : ds.get('test',''),
         'nc'   : ds['nc'],
         'names': ds['names']
     }
-    new_yaml_path = DATA_ROOT / 'night_cache.yaml'
-    with open(new_yaml_path, 'w') as f:
+    out_yaml = DATA_ROOT / 'night_cache.yaml'
+    with open(out_yaml, 'w') as f:
         yaml.safe_dump(new_yaml, f)
 
-    return new_yaml_path
+    return out_yaml
 
 # ---------- 1. anchor 재계산 ----------
 def calc_anchors(data_yaml):

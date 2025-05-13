@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "albumentations>=2.0.6",
+    "kornia>=0.8.1",
     "opencv-python>=4.11.0.86",
     "tifffile>=2025.5.10",
     "torch>=2.7.0",
